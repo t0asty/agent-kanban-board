@@ -40,7 +40,7 @@ It turns a plain-language project prompt into structured kanban tasks, stores th
 ### 1) Clone and enter project
 
 ```bash
-git clone <your-repo-url>
+git clone git@github.com:t0asty/agent-kanban-board.git
 cd agent-kanban-board/agentic-kanban
 ```
 
