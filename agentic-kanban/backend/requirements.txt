@@ -5,4 +5,4 @@ pydantic
 python-multipart
 python-dateutil==2.8.2
 mcp
-google-generativeai
+google-genai

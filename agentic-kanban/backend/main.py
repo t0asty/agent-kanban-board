@@ -202,6 +202,7 @@ async def generate_cards_with_agent(request: GenerateCardsRequest):
         Success response with message
     """
     logger.info(f"Generate cards endpoint called with prompt: {request.prompt[:100]}...")
+    logger.debug("Agent generate request metadata: prompt_length=%d", len(request.prompt))
     try:
         if not agent_service:
             raise HTTPException(status_code=500, detail="Agent service not initialized")
@@ -209,8 +210,14 @@ async def generate_cards_with_agent(request: GenerateCardsRequest):
         if not db:
             raise HTTPException(status_code=500, detail="Database not initialized")
         
+        logger.debug(
+            "Agent service readiness: model_configured=%s",
+            bool(getattr(agent_service, "model", None) and getattr(agent_service, "gemini_api_key", None))
+        )
+        
         # Generate cards using the agent
         cards_data = await agent_service.generate_cards_from_prompt(request.prompt)
+        logger.info("Agent returned %d cards before DB insert", len(cards_data) if cards_data else 0)
         
         if not cards_data:
             raise HTTPException(status_code=500, detail="Agent failed to generate cards")
