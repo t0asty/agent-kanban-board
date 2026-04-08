@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+agentic-kanban/backend/chroma_db/
 develop-eggs/
 dist/
 downloads/
