@@ -18,6 +18,9 @@ export interface Card {
   updatedAt: string
   tags: string[]
   completedAt: string | null
+  agentStatus?: "idle" | "running" | "error" | null
+  lastAgentRunAt?: string | null
+  lastAgentSummary?: string | null
 }
 
 export interface CreateCardRequest {
@@ -31,6 +34,25 @@ export interface UpdateCardRequest {
   order?: number
   tags?: string[]
   completedAt?: string | null
+  agentStatus?: Card['agentStatus']
+  lastAgentRunAt?: string | null
+  lastAgentSummary?: string | null
+}
+
+export interface CardAgentRunPayload {
+  run_id: string
+  card_id: string
+}
+
+export interface CardAgentStatusPayload {
+  status: 'idle' | 'running' | 'completed' | 'failed'
+  run_id: string | null
+  card_id: string
+  step_count: number
+  error: string | null
+  summary: string | null
+  started_at: string | null
+  finished_at: string | null
 }
 
 export interface WorkspaceInfo {
@@ -62,12 +84,17 @@ class ApiClient {
 
     try {
       const response = await fetch(url, config)
-      
+      const json = await response.json().catch(() => ({}))
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
+        const msg =
+          typeof json?.message === 'string'
+            ? json.message
+            : `HTTP error! status: ${response.status}`
+        throw new Error(msg)
       }
-      
-      return await response.json()
+
+      return json as ApiResponse<T>
     } catch (error) {
       console.error('API request failed:', error)
       throw error
@@ -126,6 +153,47 @@ class ApiClient {
     return this.request<{ message: string }>('/api/cards', {
       method: 'DELETE',
     })
+  }
+
+  async runCardAgent(
+    cardId: string,
+    opts?: { goal?: string; max_steps?: number; max_wall_seconds?: number }
+  ): Promise<ApiResponse<CardAgentRunPayload>> {
+    const url = `${this.baseURL}/api/cards/${encodeURIComponent(cardId)}/agent/run`
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        goal: opts?.goal ?? null,
+        max_steps: opts?.max_steps ?? 16,
+        max_wall_seconds: opts?.max_wall_seconds ?? 300,
+      }),
+    })
+    const json = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      const msg =
+        typeof json?.message === 'string'
+          ? json.message
+          : `HTTP error! status: ${response.status}`
+      throw new Error(msg)
+    }
+    return json as ApiResponse<CardAgentRunPayload>
+  }
+
+  async getCardAgentStatus(
+    cardId: string
+  ): Promise<{ success: boolean; message: string; data: CardAgentStatusPayload }> {
+    const url = `${this.baseURL}/api/cards/${encodeURIComponent(cardId)}/agent/status`
+    const response = await fetch(url)
+    const json = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      const msg =
+        typeof json?.message === 'string'
+          ? json.message
+          : `HTTP error! status: ${response.status}`
+      throw new Error(msg)
+    }
+    return json as { success: boolean; message: string; data: CardAgentStatusPayload }
   }
 
   // Health check

@@ -1,4 +1,4 @@
-from signal import strsignal
+import ast
 import chromadb
 import json
 from typing import List, Optional, Dict, Any
@@ -10,6 +10,61 @@ from models import Card, CardUpdate, dynamic_models
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
+
+# Chroma metadata is string-only; we must not write Python None as the literal "None" for
+# optional fields that are parsed back as datetimes or enums (see all_card_dict_fields_to_str).
+_METADATA_SKIP_NONE_KEYS = frozenset(
+    {"completedAt", "lastAgentRunAt", "lastAgentSummary", "agentStatus"}
+)
+
+
+def _parse_metadata_datetime(value: Any) -> Optional[datetime]:
+    """Parse a Chroma metadata value into datetime, or None if absent / placeholder."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s == "None":
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        logger.warning("Invalid datetime in card metadata: %r", value)
+        return None
+
+
+def _normalize_optional_metadata_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s == "None":
+        return None
+    return s
+
+
+def _parse_metadata_tags(value: Any) -> List[str]:
+    """Chroma stores tags as a string; merged updates may still have tags as a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(t) for t in value if t is not None]
+    s = str(value).strip()
+    if not s or s == "None":
+        return []
+    try:
+        parsed = ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        logger.warning("Could not parse tags metadata: %r", value)
+        return []
+    if isinstance(parsed, (list, tuple)):
+        return [str(t) for t in parsed if t is not None]
+    return [str(parsed)]
+
+
+def _updates_to_plain_dict(updates: Any) -> Dict[str, Any]:
+    """Pydantic v1/v2 compatible dump for merge into Chroma metadata."""
+    if hasattr(updates, "model_dump"):
+        return updates.model_dump(exclude_unset=True, mode="python")
+    return updates.dict(exclude_unset=True)
 
 
 class CardDatabase:
@@ -140,8 +195,19 @@ class CardDatabase:
                             # completedAt field is missing or empty - set to None
                             card_data['completedAt'] = None
                         if 'tags' in card_data:
-                            card_data['tags'] = eval(metadata['tags'])
-                        
+                            card_data['tags'] = _parse_metadata_tags(metadata['tags'])
+                        card_data["lastAgentRunAt"] = _parse_metadata_datetime(
+                            metadata.get("lastAgentRunAt")
+                        )
+                        if "lastAgentSummary" in metadata:
+                            card_data["lastAgentSummary"] = _normalize_optional_metadata_str(
+                                metadata.get("lastAgentSummary")
+                            )
+                        if "agentStatus" in metadata:
+                            card_data["agentStatus"] = _normalize_optional_metadata_str(
+                                metadata.get("agentStatus")
+                            )
+
                         # Create Card object using current model
                         card = Card(**card_data)
                         cards.append(card)
@@ -174,15 +240,15 @@ class CardDatabase:
         try:
             # Get current card
             results = self.collection.get(ids=[card_id])
-            if not results['metadatas']:
-                logger.warning(f"Card {card_id} not found for update")
+            if not results["metadatas"]:
+                logger.warning("Card %s not found for update (Chroma returned no metadata)", card_id)
                 return None
             
             current_metadata = results['metadatas'][0]
             logger.debug(f"Current card data: {current_metadata}")
             
             # Update fields
-            update_dict = updates.dict(exclude_unset=True)
+            update_dict = _updates_to_plain_dict(updates)
             if update_dict:
                 logger.debug(f"Update fields: {update_dict}")
                 
@@ -220,13 +286,27 @@ class CardDatabase:
                     else:
                         card_data['completedAt'] = None
                 if 'tags' in card_data:
-                    card_data['tags'] = eval(updated_metadata['tags'])
-                
+                    card_data['tags'] = _parse_metadata_tags(updated_metadata['tags'])
+                card_data["lastAgentRunAt"] = _parse_metadata_datetime(
+                    updated_metadata.get("lastAgentRunAt")
+                )
+                if "lastAgentSummary" in updated_metadata:
+                    card_data["lastAgentSummary"] = _normalize_optional_metadata_str(
+                        updated_metadata.get("lastAgentSummary")
+                    )
+                if "agentStatus" in updated_metadata:
+                    card_data["agentStatus"] = _normalize_optional_metadata_str(
+                        updated_metadata.get("agentStatus")
+                    )
+
                 updated_card = Card(**card_data)
                 logger.info(f"Successfully updated card {card_id}")
                 return updated_card
             else:
-                logger.info(f"No updates provided for card {card_id}")
+                logger.info(
+                    "No updates provided for card %s (empty model dump — check Pydantic field names)",
+                    card_id,
+                )
                 return None
             
         except Exception as e:
@@ -279,8 +359,19 @@ class CardDatabase:
                 # completedAt field is missing or empty - set to None
                 card_data['completedAt'] = None
             if 'tags' in card_data:
-                card_data['tags'] = eval(metadata['tags'])
-            
+                card_data['tags'] = _parse_metadata_tags(metadata['tags'])
+            card_data["lastAgentRunAt"] = _parse_metadata_datetime(
+                metadata.get("lastAgentRunAt")
+            )
+            if "lastAgentSummary" in metadata:
+                card_data["lastAgentSummary"] = _normalize_optional_metadata_str(
+                    metadata.get("lastAgentSummary")
+                )
+            if "agentStatus" in metadata:
+                card_data["agentStatus"] = _normalize_optional_metadata_str(
+                    metadata.get("agentStatus")
+                )
+
             card = Card(**card_data)
             logger.debug(f"Successfully retrieved card {card_id}")
             return card
@@ -364,11 +455,10 @@ def all_card_dict_fields_to_str(card_dict: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(value, list):
             result[key] = str([str(item) for item in value])
         elif value is None:
-            # For nullable fields like completedAt, skip them entirely
-            # ChromaDB doesn't accept None values in metadata
-            if key not in ['completedAt']:
+            # ChromaDB doesn't accept None in metadata; skip optional fields instead of
+            # storing the literal string "None" (breaks datetime/enum parsing on read).
+            if key not in _METADATA_SKIP_NONE_KEYS:
                 result[key] = "None"
-            # Skip completedAt when it's None - don't include it in metadata
         else:
             result[key] = str(value)
     return result

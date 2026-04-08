@@ -50,6 +50,18 @@
                   "type": "null"
                 }
               ]
+            },
+            "agentStatus": {
+              "type": "string",
+              "enum": ["idle", "running", "error"],
+              "description": "Agent lifecycle display state for this card"
+            },
+            "lastAgentRunAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "lastAgentSummary": {
+              "type": "string"
             }
           },
           "required": [

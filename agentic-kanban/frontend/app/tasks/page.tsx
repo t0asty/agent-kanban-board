@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge"
 import { Sidebar } from "@/components/sidebar"
 import { LoadingColumn, LoadingSpinner } from "@/components/ui/loading-spinner"
 import { useCards, useOptimisticUpdateCard } from "@/hooks/use-cards"
+import { useWorkspace } from "@/hooks/use-workspace"
 import { useInitializeData } from "@/hooks/use-initialize-data"
 import { useDeleteAllCards } from "@/hooks/use-delete-all-cards"
 import type { Card as TaskCard } from "@/lib/api"
@@ -38,6 +39,7 @@ const statusColumns = {
 
 export default function TaskManagement() {
   const { data: tasks = [], isLoading, error } = useCards()
+  const { data: workspaceInfo } = useWorkspace()
   const updateCardMutation = useOptimisticUpdateCard()
   const initializeDataMutation = useInitializeData()
   const deleteAllCardsMutation = useDeleteAllCards()
@@ -258,6 +260,18 @@ export default function TaskManagement() {
                 <p className="text-gray-600 dark:text-gray-300 mt-2">
                   Organize and track your tasks with our intelligent Kanban board
                 </p>
+                {workspaceInfo?.configured && workspaceInfo.path ? (
+                  <p
+                    className="text-xs text-gray-500 dark:text-gray-400 mt-2 font-mono truncate max-w-2xl"
+                    title={workspaceInfo.path}
+                  >
+                    Agent workspace: {workspaceInfo.path}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-700 dark:text-amber-300 mt-2">
+                    Card agents write files only when a workspace path is set on Home.
+                  </p>
+                )}
                 {updateCardMutation.isPending && (
                   <div className="flex items-center gap-2 mt-2 text-sm text-blue-600 dark:text-blue-400">
                     <LoadingSpinner size="sm" />

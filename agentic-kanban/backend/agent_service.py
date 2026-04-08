@@ -3,12 +3,23 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from google import genai
 from google.genai import types
 
+from agent_interaction_log import (
+    json_preview,
+    log_generate_cards_end,
+    log_generate_cards_llm_request,
+    log_generate_cards_prompt_full,
+    log_generate_cards_response,
+    log_generate_cards_start,
+    log_generate_cards_tool,
+)
 from workspace_fs import workspace_list, workspace_read, workspace_write
 
 logger = logging.getLogger(__name__)
@@ -96,10 +107,18 @@ class AgentService:
         self, prompt: str, workspace_root: Optional[Path] = None
     ) -> List[Dict[str, Any]]:
         """Generate cards using Gemini AI, optionally with workspace file tools."""
+        run_id = f"gen-{uuid.uuid4().hex[:12]}"
         logger.debug(
             "Sending prompt to Gemini (prompt_length=%d, workspace=%s)",
             len(prompt),
             str(workspace_root) if workspace_root else None,
+        )
+        log_generate_cards_start(
+            run_id=run_id,
+            model=self.model_name,
+            prompt_chars=len(prompt),
+            workspace=str(workspace_root) if workspace_root else None,
+            max_tool_rounds=24 if workspace_root is not None else None,
         )
 
         base_instructions = """You are a kanban board task generator. Given a user's project description, generate a list of kanban cards (tasks).
@@ -134,7 +153,20 @@ User input: {prompt}
                 Args:
                     relative_path: Directory relative to workspace (default: root). Use "." for the workspace root.
                 """
-                return workspace_list(root, relative_path)
+                t0 = time.perf_counter()
+                try:
+                    out = workspace_list(root, relative_path)
+                except Exception as e:
+                    logger.exception("generate_cards list_workspace_directory")
+                    out = json.dumps({"error": str(e)})
+                log_generate_cards_tool(
+                    run_id=run_id,
+                    tool="list_workspace_directory",
+                    arguments_summary=json_preview({"relative_path": relative_path}),
+                    result=out,
+                    duration_ms=(time.perf_counter() - t0) * 1000,
+                )
+                return out
 
             def read_workspace_file(relative_path: str) -> str:
                 """Read a text file under the workspace. Path is relative to the workspace root.
@@ -142,7 +174,20 @@ User input: {prompt}
                 Args:
                     relative_path: File path relative to workspace (e.g. "README.md", "src/app.ts").
                 """
-                return workspace_read(root, relative_path)
+                t0 = time.perf_counter()
+                try:
+                    out = workspace_read(root, relative_path)
+                except Exception as e:
+                    logger.exception("generate_cards read_workspace_file")
+                    out = json.dumps({"error": str(e)})
+                log_generate_cards_tool(
+                    run_id=run_id,
+                    tool="read_workspace_file",
+                    arguments_summary=json_preview({"relative_path": relative_path}),
+                    result=out,
+                    duration_ms=(time.perf_counter() - t0) * 1000,
+                )
+                return out
 
             def write_workspace_file(relative_path: str, content: str) -> str:
                 """Create or overwrite a text file under the workspace. Creates parent folders if needed.
@@ -151,7 +196,22 @@ User input: {prompt}
                     relative_path: File path relative to workspace.
                     content: Full file contents (UTF-8 text).
                 """
-                return workspace_write(root, relative_path, content)
+                t0 = time.perf_counter()
+                try:
+                    out = workspace_write(root, relative_path, content)
+                except Exception as e:
+                    logger.exception("generate_cards write_workspace_file")
+                    out = json.dumps({"error": str(e)})
+                log_generate_cards_tool(
+                    run_id=run_id,
+                    tool="write_workspace_file",
+                    arguments_summary=json_preview(
+                        {"relative_path": relative_path, "content_chars": len(content or "")}
+                    ),
+                    result=out,
+                    duration_ms=(time.perf_counter() - t0) * 1000,
+                )
+                return out
 
             tools = [
                 list_workspace_directory,
@@ -163,7 +223,7 @@ User input: {prompt}
                 max_output_tokens=8192,
                 tools=tools,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                    maximumRemoteCalls=24,
+                    maximum_remote_calls=24,
                 ),
             )
         else:
@@ -180,6 +240,19 @@ Return JSON array:"""
                 response_mime_type="application/json",
             )
 
+        tool_names = (
+            [getattr(t, "__name__", repr(t)) for t in tools]
+            if workspace_root is not None
+            else []
+        )
+        log_generate_cards_llm_request(
+            run_id=run_id,
+            model=self.model_name,
+            prompt_chars=len(gemini_prompt),
+            tool_names=tool_names,
+        )
+        log_generate_cards_prompt_full(run_id=run_id, prompt=gemini_prompt)
+
         try:
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
@@ -190,11 +263,36 @@ Return JSON array:"""
 
             if response.text:
                 logger.debug("Received non-empty response from Gemini")
-                cards_data = self._parse_cards_json_text(response.text)
-                formatted_cards = self._format_cards(cards_data)
+                try:
+                    cards_data = self._parse_cards_json_text(response.text)
+                    formatted_cards = self._format_cards(cards_data)
+                except json.JSONDecodeError as e:
+                    log_generate_cards_response(
+                        run_id=run_id, response_text=response.text, num_cards=0
+                    )
+                    log_generate_cards_end(
+                        run_id=run_id, outcome="parse_json_failed", detail=str(e)
+                    )
+                    logger.error("Failed to parse Gemini JSON response: %s", e)
+                    logger.warning(
+                        "Falling back to keyword-based generation due to JSON parsing failure"
+                    )
+                    return self._generate_fallback_cards(prompt)
+                log_generate_cards_response(
+                    run_id=run_id,
+                    response_text=response.text,
+                    num_cards=len(formatted_cards),
+                )
+                log_generate_cards_end(
+                    run_id=run_id,
+                    outcome="success",
+                    detail=f"{len(formatted_cards)} cards",
+                )
                 logger.info("Gemini generation succeeded with %d cards", len(formatted_cards))
                 return formatted_cards
             logger.warning("Empty response from Gemini")
+            log_generate_cards_response(run_id=run_id, response_text=None, num_cards=0)
+            log_generate_cards_end(run_id=run_id, outcome="empty_response", detail="")
             logger.warning(
                 "Falling back to keyword-based generation due to empty Gemini response"
             )
@@ -202,12 +300,14 @@ Return JSON array:"""
 
         except json.JSONDecodeError as e:
             logger.error("Failed to parse Gemini JSON response: %s", e)
+            log_generate_cards_end(run_id=run_id, outcome="exception_json", detail=str(e))
             logger.warning(
                 "Falling back to keyword-based generation due to JSON parsing failure"
             )
             return self._generate_fallback_cards(prompt)
         except Exception as e:
             logger.error("Gemini API error: %s", e)
+            log_generate_cards_end(run_id=run_id, outcome="exception_api", detail=str(e))
             logger.warning(
                 "Falling back to keyword-based generation due to Gemini API error"
             )

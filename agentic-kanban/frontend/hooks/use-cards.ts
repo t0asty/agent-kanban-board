@@ -10,6 +10,10 @@ export const cardKeys = {
   detail: (id: string) => [...cardKeys.details(), id] as const,
 }
 
+export const cardAgentKeys = {
+  status: (cardId: string) => ['cardAgentStatus', cardId] as const,
+}
+
 // Get all cards
 export function useCards() {
   return useQuery({
@@ -126,6 +130,38 @@ export function useOptimisticUpdateCard() {
     onSettled: () => {
       // Always refetch after error or success
       queryClient.invalidateQueries({ queryKey: cardKeys.lists() })
+    },
+  })
+}
+
+export function useCardAgentStatus(cardId: string | undefined, open: boolean) {
+  return useQuery({
+    queryKey: cardAgentKeys.status(cardId ?? ''),
+    queryFn: async () => {
+      const res = await apiClient.getCardAgentStatus(cardId!)
+      return res.data
+    },
+    enabled: !!cardId && open,
+    refetchInterval: (query) =>
+      query.state.data?.status === 'running' ? 2000 : false,
+  })
+}
+
+export function useRunCardAgent() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      cardId,
+      opts,
+    }: {
+      cardId: string
+      opts?: { goal?: string; max_steps?: number; max_wall_seconds?: number }
+    }) => {
+      return apiClient.runCardAgent(cardId, opts)
+    },
+    onSuccess: (_res, { cardId }) => {
+      queryClient.invalidateQueries({ queryKey: cardKeys.lists() })
+      queryClient.invalidateQueries({ queryKey: cardAgentKeys.status(cardId) })
     },
   })
 }

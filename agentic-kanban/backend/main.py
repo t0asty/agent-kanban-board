@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Optional
+import os
 import uvicorn
 import logging
 import traceback
@@ -13,6 +14,7 @@ from models import Card, CardList, CardUpdate, CardResponse, CardsResponse, relo
 from database import CardDatabase
 from agent_service import AgentService
 from workspace_store import clear_workspace, get_workspace_path, set_workspace
+from card_agent_runner import card_agent_registry, schedule_card_agent_run
 
 # Configure logging
 logging.basicConfig(
@@ -25,6 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Agent LLM/tool traces: logger name ``agentic.agent_interactions`` (see agent_interaction_log.py).
+# Set AGENT_DEBUG_FULL=1 to log full prompts and responses at DEBUG (very large).
+# Card agent: AGENT_TOOL_MODE=AUTO disables forced function-calling (default is ANY so the model cannot skip tools).
+_agent_ix = logging.getLogger("agentic.agent_interactions")
+if os.environ.get("AGENT_DEBUG_FULL", "").strip().lower() in ("1", "true", "yes", "on"):
+    _agent_ix.setLevel(logging.DEBUG)
+
 
 class GenerateCardsRequest(BaseModel):
     prompt: str
@@ -34,6 +43,14 @@ class WorkspaceSetRequest(BaseModel):
     """Absolute path on the machine running the backend. Empty clears the workspace."""
 
     path: Optional[str] = None
+
+
+class CardAgentRunRequest(BaseModel):
+    """Start a background Gemini agent run for one card."""
+
+    goal: Optional[str] = None
+    max_steps: int = 16
+    max_wall_seconds: float = 300.0
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -455,6 +472,107 @@ async def get_card(card_id: str):
         raise
     except Exception as e:
         error_msg = f"Failed to retrieve card: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.post("/api/cards/{card_id}/agent/run")
+async def start_card_agent_run(card_id: str, body: CardAgentRunRequest):
+    """Start a background Gemini agent for this card (202 Accepted)."""
+    logger.info("Start card agent run for card_id=%s", card_id)
+    try:
+        if not db:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        if not agent_service or not getattr(agent_service, "gemini_api_key", None):
+            raise HTTPException(
+                status_code=503,
+                detail="Gemini is not configured (set GOOGLE_API_KEY on the backend)",
+            )
+        if not db.get_card_by_id(card_id):
+            raise HTTPException(status_code=404, detail=f"Card with ID {card_id} not found")
+
+        max_steps = max(1, min(body.max_steps, 64))
+        max_wall_seconds = max(30.0, min(body.max_wall_seconds, 900.0))
+
+        run_id = await schedule_card_agent_run(
+            card_id=card_id,
+            goal=body.goal,
+            max_steps=max_steps,
+            max_wall_seconds=max_wall_seconds,
+            db=db,
+            CardUpdate=CardUpdate,
+            gemini_api_key=agent_service.gemini_api_key,
+            model_name=agent_service.model_name,
+            workspace_path=get_workspace_path(),
+        )
+        if run_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail="An agent run is already in progress for this card",
+            )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "success": True,
+                "message": "Card agent run started",
+                "data": {"run_id": run_id, "card_id": card_id},
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to start card agent: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
+@app.get("/api/cards/{card_id}/agent/status")
+async def get_card_agent_status(card_id: str):
+    """In-memory status of the latest agent run for this card."""
+    logger.debug("Card agent status for card_id=%s", card_id)
+    try:
+        if not db:
+            raise HTTPException(status_code=500, detail="Database not initialized")
+        if not db.get_card_by_id(card_id):
+            raise HTTPException(status_code=404, detail=f"Card with ID {card_id} not found")
+
+        st = await card_agent_registry.get_state(card_id)
+        if not st:
+            return {
+                "success": True,
+                "message": "No agent run recorded for this card yet",
+                "data": {
+                    "status": "idle",
+                    "run_id": None,
+                    "card_id": card_id,
+                    "step_count": 0,
+                    "error": None,
+                    "summary": None,
+                    "started_at": None,
+                    "finished_at": None,
+                },
+            }
+
+        return {
+            "success": True,
+            "message": "ok",
+            "data": {
+                "status": st.status,
+                "run_id": st.run_id,
+                "card_id": card_id,
+                "step_count": st.step_count,
+                "error": st.error,
+                "summary": st.summary,
+                "started_at": st.started_at.isoformat() + "Z" if st.started_at else None,
+                "finished_at": st.finished_at.isoformat() + "Z" if st.finished_at else None,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Failed to get card agent status: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=error_msg)
