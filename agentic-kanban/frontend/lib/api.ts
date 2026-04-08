@@ -33,6 +33,11 @@ export interface UpdateCardRequest {
   completedAt?: string | null
 }
 
+export interface WorkspaceInfo {
+  path: string | null
+  configured: boolean
+}
+
 // API Client
 class ApiClient {
   private baseURL: string
@@ -89,6 +94,18 @@ class ApiClient {
     return this.request<null>('/api/generate-cards', {
       method: 'POST',
       body: JSON.stringify({ prompt }),
+    })
+  }
+
+  async getWorkspace(): Promise<ApiResponse<WorkspaceInfo>> {
+    return this.request<WorkspaceInfo>('/api/workspace')
+  }
+
+  /** Pass empty string to clear the workspace on the server. */
+  async setWorkspace(path: string): Promise<ApiResponse<WorkspaceInfo>> {
+    return this.request<WorkspaceInfo>('/api/workspace', {
+      method: 'POST',
+      body: JSON.stringify({ path: path.trim() === '' ? null : path }),
     })
   }
 

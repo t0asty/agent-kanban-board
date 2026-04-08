@@ -2,9 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import re
+from pathlib import Path
 from typing import Dict, Any, List, Optional
+
 from google import genai
 from google.genai import types
+
+from workspace_fs import workspace_list, workspace_read, workspace_write
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,9 @@ class AgentService:
             self.model = None
             logger.warning("No Gemini API key found, will use fallback generation")
     
-    async def generate_cards_from_prompt(self, prompt: str) -> List[Dict[str, Any]]:
+    async def generate_cards_from_prompt(
+        self, prompt: str, workspace_path: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Generate kanban cards from a user prompt using Gemini AI or fallback logic
         
@@ -34,15 +41,25 @@ class AgentService:
         Returns:
             List of card dictionaries ready for creation
         """
+        workspace_root: Optional[Path] = None
+        if workspace_path:
+            try:
+                wp = Path(workspace_path).expanduser().resolve()
+                if wp.is_dir():
+                    workspace_root = wp
+            except OSError as e:
+                logger.warning("Invalid workspace path %r: %s", workspace_path, e)
+
         logger.debug(
-            "generate_cards_from_prompt called (prompt_length=%d, model_configured=%s)",
+            "generate_cards_from_prompt called (prompt_length=%d, model_configured=%s, workspace=%s)",
             len(prompt),
-            bool(self.model and self.gemini_api_key)
+            bool(self.model and self.gemini_api_key),
+            str(workspace_root) if workspace_root else None,
         )
         if self.model and self.gemini_api_key:
             logger.info("Using Gemini agent generation path")
             try:
-                return await self._generate_cards_with_gemini(prompt)
+                return await self._generate_cards_with_gemini(prompt, workspace_root=workspace_root)
             except Exception as e:
                 logger.error(f"Gemini generation failed: {e}")
                 # Fall back to basic generation
@@ -52,54 +69,148 @@ class AgentService:
             logger.info("Using fallback generation path (Gemini not configured)")
             return self._generate_fallback_cards(prompt)
     
-    async def _generate_cards_with_gemini(self, prompt: str) -> List[Dict[str, Any]]:
-        """Generate cards using Gemini AI"""
-        logger.debug("Sending prompt to Gemini (prompt_length=%d)", len(prompt))
-        gemini_prompt = f"""You are a kanban board task generator. Given a user's project description, generate a list of kanban cards (tasks) in JSON format.
+    def _parse_cards_json_text(self, text: str) -> List[Dict[str, Any]]:
+        """Parse model output into a list of card dicts; supports raw JSON or fenced blocks."""
+        raw = (text or "").strip()
+        if not raw:
+            return []
 
-Each card should have:
+        candidates = [raw]
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
+        if fence:
+            candidates.insert(0, fence.group(1).strip())
+        bracket = re.search(r"\[[\s\S]*\]", raw)
+        if bracket:
+            candidates.append(bracket.group(0).strip())
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, list):
+                return data
+        raise json.JSONDecodeError("No JSON array of cards found", raw, 0)
+
+    async def _generate_cards_with_gemini(
+        self, prompt: str, workspace_root: Optional[Path] = None
+    ) -> List[Dict[str, Any]]:
+        """Generate cards using Gemini AI, optionally with workspace file tools."""
+        logger.debug(
+            "Sending prompt to Gemini (prompt_length=%d, workspace=%s)",
+            len(prompt),
+            str(workspace_root) if workspace_root else None,
+        )
+
+        base_instructions = """You are a kanban board task generator. Given a user's project description, generate a list of kanban cards (tasks).
+
+Each card must have:
 - title: A clear, concise task title
 - description: A detailed description of what needs to be done
 - status: One of "research", "in-progress", "done", "blocked", or "planned"
 - order: Sequential number starting from 1
 - tags: Array of relevant tags (3-5 tags per card)
 
-Generate 5-8 relevant tasks based on the user's input. Return ONLY a valid JSON array of cards, no additional text.
+Generate 5-8 relevant tasks based on the user's input."""
+
+        if workspace_root is not None:
+            root_display = str(workspace_root)
+            gemini_prompt = f"""{base_instructions}
+
+The user's project folder on this machine (sandboxed for your tools) is:
+{root_display}
+
+You have tools to list directories, read files, and write files under that folder only. Use them when inspecting the codebase, writing plans, reports, or scaffolding files would help produce better tasks.
+
+When you are completely done (including after any tool use), respond with ONLY a valid JSON array of card objects. No markdown fences, no explanation before or after the array.
+
+User input: {prompt}
+"""
+            root = workspace_root.resolve()
+
+            def list_workspace_directory(relative_path: str = ".") -> str:
+                """List files and subdirectories under a path relative to the workspace root.
+
+                Args:
+                    relative_path: Directory relative to workspace (default: root). Use "." for the workspace root.
+                """
+                return workspace_list(root, relative_path)
+
+            def read_workspace_file(relative_path: str) -> str:
+                """Read a text file under the workspace. Path is relative to the workspace root.
+
+                Args:
+                    relative_path: File path relative to workspace (e.g. "README.md", "src/app.ts").
+                """
+                return workspace_read(root, relative_path)
+
+            def write_workspace_file(relative_path: str, content: str) -> str:
+                """Create or overwrite a text file under the workspace. Creates parent folders if needed.
+
+                Args:
+                    relative_path: File path relative to workspace.
+                    content: Full file contents (UTF-8 text).
+                """
+                return workspace_write(root, relative_path, content)
+
+            tools = [
+                list_workspace_directory,
+                read_workspace_file,
+                write_workspace_file,
+            ]
+            config = types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=8192,
+                tools=tools,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    maximumRemoteCalls=24,
+                ),
+            )
+        else:
+            gemini_prompt = f"""{base_instructions}
+
+Return ONLY a valid JSON array of cards, no additional text.
 
 User input: {prompt}
 
 Return JSON array:"""
-        
+            config = types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=2048,
+                response_mime_type="application/json",
+            )
+
         try:
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.model_name,
                 contents=gemini_prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=2048,
-                    response_mime_type="application/json"
-                )
+                config=config,
             )
-            
+
             if response.text:
                 logger.debug("Received non-empty response from Gemini")
-                cards_data = json.loads(response.text)
+                cards_data = self._parse_cards_json_text(response.text)
                 formatted_cards = self._format_cards(cards_data)
                 logger.info("Gemini generation succeeded with %d cards", len(formatted_cards))
                 return formatted_cards
-            else:
-                logger.warning("Empty response from Gemini")
-                logger.warning("Falling back to keyword-based generation due to empty Gemini response")
-                return self._generate_fallback_cards(prompt)
-                
+            logger.warning("Empty response from Gemini")
+            logger.warning(
+                "Falling back to keyword-based generation due to empty Gemini response"
+            )
+            return self._generate_fallback_cards(prompt)
+
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse Gemini JSON response: {e}")
-            logger.warning("Falling back to keyword-based generation due to JSON parsing failure")
+            logger.error("Failed to parse Gemini JSON response: %s", e)
+            logger.warning(
+                "Falling back to keyword-based generation due to JSON parsing failure"
+            )
             return self._generate_fallback_cards(prompt)
         except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            logger.warning("Falling back to keyword-based generation due to Gemini API error")
+            logger.error("Gemini API error: %s", e)
+            logger.warning(
+                "Falling back to keyword-based generation due to Gemini API error"
+            )
             return self._generate_fallback_cards(prompt)
     
     def _generate_fallback_cards(self, prompt: str) -> List[Dict[str, Any]]:

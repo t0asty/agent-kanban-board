@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from typing import List
+from typing import List, Optional
 import uvicorn
 import logging
 import traceback
@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from models import Card, CardList, CardUpdate, CardResponse, CardsResponse, reload_models, dynamic_models
 from database import CardDatabase
 from agent_service import AgentService
+from workspace_store import clear_workspace, get_workspace_path, set_workspace
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 class GenerateCardsRequest(BaseModel):
     prompt: str
+
+
+class WorkspaceSetRequest(BaseModel):
+    """Absolute path on the machine running the backend. Empty clears the workspace."""
+
+    path: Optional[str] = None
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -190,14 +197,56 @@ async def reload_schema():
         raise HTTPException(status_code=500, detail=error_msg)
 
 
+@app.get("/api/workspace")
+async def get_workspace():
+    """Return the configured agent workspace directory (server-side path)."""
+    logger.info("Get workspace endpoint called")
+    path = get_workspace_path()
+    return {
+        "success": True,
+        "message": "Workspace status retrieved",
+        "data": {"path": path, "configured": bool(path)},
+    }
+
+
+@app.post("/api/workspace")
+async def post_workspace(request: WorkspaceSetRequest):
+    """Set or clear the directory agents may read/write via tool calls."""
+    logger.info("Set workspace endpoint called")
+    try:
+        raw = (request.path or "").strip()
+        if not raw:
+            clear_workspace()
+            return {
+                "success": True,
+                "message": "Workspace cleared",
+                "data": {"path": None, "configured": False},
+            }
+        resolved = set_workspace(raw)
+        return {
+            "success": True,
+            "message": "Workspace updated",
+            "data": {"path": resolved, "configured": True},
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        error_msg = f"Failed to set workspace: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=error_msg)
+
+
 @app.post("/api/generate-cards", response_model=CardResponse)
 async def generate_cards_with_agent(request: GenerateCardsRequest):
     """
-    Generate kanban cards using the MCP agent based on a prompt
-    
+    Generate kanban cards using the AI agent (Gemini when configured) from a prompt.
+    If a workspace is set via POST /api/workspace, the model may list, read, and write
+    files only under that directory while generating tasks.
+
     Args:
         request: Request containing the user prompt
-        
+
     Returns:
         Success response with message
     """
@@ -215,8 +264,11 @@ async def generate_cards_with_agent(request: GenerateCardsRequest):
             bool(getattr(agent_service, "model", None) and getattr(agent_service, "gemini_api_key", None))
         )
         
-        # Generate cards using the agent
-        cards_data = await agent_service.generate_cards_from_prompt(request.prompt)
+        # Generate cards using the agent (optional workspace for file tools)
+        workspace = get_workspace_path()
+        cards_data = await agent_service.generate_cards_from_prompt(
+            request.prompt, workspace_path=workspace
+        )
         logger.info("Agent returned %d cards before DB insert", len(cards_data) if cards_data else 0)
         
         if not cards_data:
